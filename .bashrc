@@ -25,6 +25,7 @@ gr    | git reset --soft HEAD~1         | 回退上一条提交并保留暂存�
 
 函数
 --------------------------------------------------------------
+d         - 安装依赖并启动项目
 gi        - 拉取最新代码并重新安装依赖
 gcp       - 快速提交 commit 到远程
 gca       - 合并当前提交到上一条提交
@@ -48,7 +49,8 @@ EOF
   FUNCTION_HELP["gcp"]="gcp - 快速提交 commit 到远程\n用法示例: gcp 'commit message'"
   FUNCTION_HELP["gca"]="gca - 合并当前提交到上一条提交\n用法示例: gca -p"
   FUNCTION_HELP["gst"]="gst - 更新分支、安装依赖并启动项目\n用法示例: gst dev"
-  FUNCTION_HELP["gcpick"]="gcpick - 批量 cherry-pick 工具\n用法示例: gcpick V3.2.3.0 feature/login -- a1b2c3 d4e5f6"
+  FUNCTION_HELP["d"]="d - 更新分支、安装依赖并启动项目\n用法示例: d dev"
+  FUNCTION_HELP["gcpick"]="gcpick - 批量 cherry-pick 工具\n用法示例: gcpick V3.2.3.0 feature/login -- a1b2c3 d4e5f6\n          gcpick V3.2.3.0* -- a1b2c3"
 
   # ========= 参数解析 =========
   case "$1" in
@@ -121,14 +123,22 @@ gst() {
     nr "$name"
 }
 
+# 项目启动命令
+d() {
+    rm -rf node_modules
+    ni
+    # 设置启动默认值
+    name=${1:-dev}
+    nr "$name"
+}
+
 # cherry-pick 多条commit到指定分支并push
 gcpick() {
   # ===============================
   # 1. 版本 / 分支映射
   # ===============================
   declare -A VERSION_BRANCH_MAP
-  # 分支映射，用于给多个分支定义一个统一的别名，方便使用
-  VERSION_BRANCH_MAP["LTS"]="main"
+  VERSION_BRANCH_MAP["LTS"]="dev main"
 
   # ===============================
   # 0. 帮助 / 显示版本
@@ -142,10 +152,12 @@ gcpick() {
     echo ""
     echo "示例:"
     echo "  gcpick V3.2.3.0 feature/login -- a1b2c3 d4e5f6"
+    echo "  gcpick V3.2.3.0* -- a1b2c3"
     echo "  gcpick -- a1b2c3"
     echo ""
     echo "说明:"
     echo "  - VERSION_BRANCH_MAP 中有映射的版本会展开为对应分支"
+    echo "  - 以 * 结尾的目标会按 origin 远程分支前缀展开，例如 V3.2.3.0*"
     echo "  - 普通分支保持原样"
     echo "  - commit id 必须在 -- 后面指定"
     echo "  - 已存在或 empty commit 会自动跳过，并在最后汇总"
@@ -205,7 +217,24 @@ gcpick() {
   # 3. 展开目标分支
   # ===============================
   for t in "${targets[@]}"; do
-    if [[ -n "${VERSION_BRANCH_MAP[$t]}" ]]; then
+    if [[ "$t" == *"*" ]]; then
+      prefix="${t%\*}"
+      matched_remote_branches=()
+
+      while IFS= read -r remote_branch; do
+        [[ -z "$remote_branch" ]] && continue
+        matched_remote_branches+=("$remote_branch")
+      done < <(git ls-remote --heads origin "${prefix}*" | awk '{sub("refs/heads/", "", $2); print $2}')
+
+      if [ "${#matched_remote_branches[@]}" -eq 0 ]; then
+        echo "⚠️ 未找到以 $prefix 开头的远程分支（origin），跳过目标 $t"
+        continue
+      fi
+
+      for b in "${matched_remote_branches[@]}"; do
+        branches+=("$b")
+      done
+    elif [[ -n "${VERSION_BRANCH_MAP[$t]}" ]]; then
       for b in ${VERSION_BRANCH_MAP[$t]}; do
         branches+=("$b")
       done
@@ -235,17 +264,35 @@ gcpick() {
     echo ""
     echo "🚀 处理分支: $branch"
 
+    remote_branch_exists=false
+    if git ls-remote --exit-code --heads origin "$branch" &>/dev/null; then
+      remote_branch_exists=true
+    fi
+
     if git show-ref --verify --quiet "refs/heads/$branch"; then
       git checkout "$branch" || { echo "❌ 切换本地分支 $branch 失败"; continue; }
-    elif git ls-remote --exit-code --heads origin "$branch" &>/dev/null; then
-      git fetch origin "$branch":"$branch" || { echo "❌ 拉取远程分支 $branch 失败"; continue; }
-      git checkout "$branch" || { echo "❌ 切换分支 $branch 失败"; continue; }
+    elif $remote_branch_exists; then
+      git fetch origin "$branch" || { echo "❌ 拉取远程分支 $branch 失败"; continue; }
+      git checkout -b "$branch" --track "origin/$branch" || { echo "❌ 切换分支 $branch 失败"; continue; }
     else
       echo "⚠️ 分支 $branch 不存在（本地+远程），跳过"
       continue
     fi
 
-    git pull || { echo "❌ 分支 $branch pull 失败"; continue; }
+    if $remote_branch_exists; then
+      if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' &>/dev/null; then
+        git branch --set-upstream-to="origin/$branch" "$branch" || {
+          echo "❌ 分支 $branch 设置 upstream 失败"
+          continue
+        }
+      fi
+
+      git pull --ff-only origin "$branch" || { echo "❌ 分支 $branch pull 失败"; continue; }
+    elif git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' &>/dev/null; then
+      git pull --ff-only || { echo "❌ 分支 $branch pull 失败"; continue; }
+    else
+      echo "⚠️ 分支 $branch 没有可用的远程跟踪分支，跳过 pull"
+    fi
 
     for commit in "${commits[@]}"; do
       # 检查 commit 是否已经在分支
